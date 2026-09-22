@@ -156,7 +156,51 @@ export function createSignalingServer(options: SignalingServerOptions = {}): Sig
     }
 
     const requested = normalizePeerId(requestedId);
-    return requested && !registry.has(requested) ? requested : randomUUID();
+    if (!requested) {
+      return randomUUID();
+    }
+
+    const existing = registry.get(requested);
+    if (!existing) {
+      return requested;
+    }
+
+    // The id is held by a connection that is already gone - a client that reconnected faster than
+    // the heartbeat noticed its old socket die. Handing it a fresh id instead would leave its
+    // previous entry in the roster, so every other peer would sit trying to reach a socket that
+    // will never answer until the sweep reaps it, up to HEARTBEAT_INTERVAL_MS later.
+    //
+    // Not covered by a test: a socket that dies without a close frame needs a real network drop,
+    // and faking one in-process means detaching the server socket's handlers, which then keeps
+    // the http server from closing. The path is exercised by the ordinary reconnect test, which
+    // takes the `!existing` branch above.
+    if (existing.socket.readyState !== WebSocket.OPEN) {
+      releaseDeadPeer(requested);
+      return requested;
+    }
+
+    return randomUUID();
+  }
+
+  /** Removes a peer whose socket has closed, announcing it as a normal departure. */
+  function releaseDeadPeer(peerId: string): void {
+    const record = registry.get(peerId);
+    if (!record) {
+      return;
+    }
+
+    const room = record.room;
+    registry.unregister(peerId);
+
+    if (room) {
+      broadcastToRoom(room, { type: 'peer-left', id: peerId });
+      return;
+    }
+
+    const disconnected: ServerMessage = { type: 'peer-disconnected', id: peerId };
+    for (const peer of registry.roomless()) {
+      send(peer.socket, disconnected);
+    }
   }
 
   function handleRegister(socket: PeerSocket, message: Extract<ClientMessage, { type: 'register' }>): void {
