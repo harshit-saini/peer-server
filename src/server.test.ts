@@ -356,6 +356,129 @@ describe('signaling server', () => {
     await b.close();
   });
 
+  it('ignores a non-string peer id instead of admitting an unreachable peer', async () => {
+    // A numeric or object id used to flow straight into the registry key and into everyone's
+    // roster, while their clients - which stringify ids - could never signal it back.
+    const observer = await connect();
+    observer.send({ type: 'join', room: 'room-bad-ids', name: 'Observer' });
+    const joinedObserver = await observer.next('joined');
+
+    const malformedIds: unknown[] = [12345, { evil: true }, ['a'], 'short', 'x'.repeat(200), '  ', 'has spaces!!'];
+
+    for (const id of malformedIds) {
+      // A fresh socket each time, so every case is a genuine first join rather than the
+      // idempotent re-join path.
+      const bad = await connect();
+      bad.send({ type: 'join', room: 'room-bad-ids', name: 'Bad', id } as unknown as ClientMessage);
+      const joined = await bad.next('joined');
+
+      assert.match(
+        joined.id,
+        /^[0-9a-f-]{36}$/,
+        `expected a generated UUID instead of ${JSON.stringify(id)}`,
+      );
+
+      // The id the other peer is told about must be the same string, and must be reachable.
+      const announced = await observer.next('peer-joined');
+      assert.equal(announced.id, joined.id);
+
+      observer.send({ type: 'signal', target: announced.id, data: { probe: true } });
+      assert.equal((await bad.next('signal')).from, joinedObserver.id);
+
+      await bad.close();
+      await observer.next('peer-left');
+    }
+
+    await observer.close();
+  });
+
+  it('honours a well-formed requested id so a client keeps its identity across a reconnect', async () => {
+    const client = await connect();
+    client.send({ type: 'join', room: 'room-sticky-id', name: 'Ada', id: 'peer-ada-0001' });
+
+    assert.equal((await client.next('joined')).id, 'peer-ada-0001');
+
+    await client.close();
+  });
+
+  it('does not tell roomless peers about a room member leaving', async () => {
+    // peer-disconnected exists for the original flat protocol only. Sending it for a room member
+    // leaks the ids of a room those clients were never part of.
+    const legacy = await connect();
+    const member = await connect();
+
+    legacy.send({ type: 'register' });
+    await legacy.next('registered');
+
+    member.send({ type: 'join', room: 'room-no-leak', name: 'Ada' });
+    await member.next('joined');
+    member.send({ type: 'leave' });
+
+    assert.equal(await legacy.receivedNothing('peer-disconnected'), true);
+
+    await legacy.close();
+    await member.close();
+  });
+
+  it('still tells roomless peers about roomless departures', async () => {
+    const legacy = await connect();
+    const other = await connect();
+
+    legacy.send({ type: 'register' });
+    other.send({ type: 'register', id: 'legacy-departing' });
+    await legacy.next('registered');
+    await other.next('registered');
+
+    other.send({ type: 'leave' });
+
+    assert.equal((await legacy.next('peer-disconnected')).id, 'legacy-departing');
+
+    await legacy.close();
+    await other.close();
+  });
+
+  it('treats re-joining the same room as idempotent, without churning the mesh', async () => {
+    // A reconnect or a double-invoked effect must not look like leave-then-join to other peers:
+    // they would tear down working connections and lose in-flight transfers.
+    const a = await connect();
+    const b = await connect();
+
+    a.send({ type: 'join', room: 'room-idempotent', name: 'Ada' });
+    const joinedA = await a.next('joined');
+    b.send({ type: 'join', room: 'room-idempotent', name: 'Bob' });
+    const joinedB = await b.next('joined');
+    await a.next('peer-joined');
+
+    b.send({ type: 'join', room: 'room-idempotent', name: 'Bob Renamed' });
+    const rejoined = await b.next('joined');
+
+    assert.equal(rejoined.id, joinedB.id, 'identity is preserved across a re-join');
+    assert.equal(rejoined.name, 'Bob Renamed');
+    assert.deepEqual(rejoined.peers, [{ id: joinedA.id, name: 'Ada' }]);
+    assert.equal(await a.receivedNothing('peer-left'), true);
+    assert.equal(await a.receivedNothing('peer-joined'), true);
+
+    // The connection is still usable afterwards.
+    a.send({ type: 'signal', target: joinedB.id, data: { still: 'connected' } });
+    assert.deepEqual((await b.next('signal')).data, { still: 'connected' });
+
+    await a.close();
+    await b.close();
+  });
+
+  it('refuses to relay a signal a peer addressed to itself', async () => {
+    const client = await connect();
+    client.send({ type: 'join', room: 'room-self-signal', name: 'Ada' });
+    const joined = await client.next('joined');
+
+    client.send({ type: 'signal', target: joined.id, data: null });
+
+    assert.equal((await client.next('error')).code, 'invalid-message');
+    assert.equal(await client.receivedNothing('signal'), true);
+
+    await client.close();
+  });
+
   it('rate limits a client that floods the connection', async () => {
     const limited = createSignalingServer({
       messageLimit: 3,

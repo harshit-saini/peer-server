@@ -6,6 +6,8 @@ import {
   RateLimiter,
   isOriginAllowed,
   normalizeDisplayName,
+  normalizePeerId,
+  normalizeRoomCapacity,
   normalizeRoomCode,
   parseAllowedOrigins,
 } from './validation.js';
@@ -110,5 +112,46 @@ describe('origin allow list', () => {
     const allowed = parseAllowedOrigins('https://a.example');
     assert.equal(isOriginAllowed('https://evil.example', allowed), false);
     assert.equal(isOriginAllowed(undefined, allowed), false);
+  });
+});
+
+describe('normalizePeerId', () => {
+  it('accepts ids a client can round-trip through a URL or a Map key', () => {
+    assert.equal(normalizePeerId('peer-ada-0001'), 'peer-ada-0001');
+    assert.equal(normalizePeerId('  peer-ada-0001  '), 'peer-ada-0001');
+    assert.equal(normalizePeerId('a1b2c3d4-e5f6-7890-abcd-ef1234567890'), 'a1b2c3d4-e5f6-7890-abcd-ef1234567890');
+  });
+
+  it('rejects non-strings, so they cannot become an unreachable registry key', () => {
+    assert.equal(normalizePeerId(12345), null);
+    assert.equal(normalizePeerId({ evil: true }), null);
+    assert.equal(normalizePeerId(['a']), null);
+    assert.equal(normalizePeerId(null), null);
+    assert.equal(normalizePeerId(undefined), null);
+  });
+
+  it('rejects ids that are too short, too long, or contain unsafe characters', () => {
+    assert.equal(normalizePeerId('short'), null);
+    assert.equal(normalizePeerId('x'.repeat(65)), null);
+    assert.equal(normalizePeerId('has spaces!!'), null);
+    assert.equal(normalizePeerId('slash/es-here'), null);
+    assert.equal(normalizePeerId('   '), null);
+  });
+});
+
+describe('normalizeRoomCapacity', () => {
+  it('uses the fallback for unset or unusable values', () => {
+    assert.equal(normalizeRoomCapacity(undefined, 8), 8);
+    assert.equal(normalizeRoomCapacity('', 8), 8);
+    assert.equal(normalizeRoomCapacity('not a number', 8), 8);
+    assert.equal(normalizeRoomCapacity('0', 8), 8);
+    assert.equal(normalizeRoomCapacity('-4', 8), 8);
+  });
+
+  it('clamps into a range a full mesh can actually sustain', () => {
+    assert.equal(normalizeRoomCapacity('1', 8), 2);
+    assert.equal(normalizeRoomCapacity('4', 8), 4);
+    assert.equal(normalizeRoomCapacity('999', 8), 32);
+    assert.equal(normalizeRoomCapacity('6.7', 8), 6);
   });
 });

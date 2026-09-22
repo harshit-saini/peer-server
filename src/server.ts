@@ -2,13 +2,23 @@ import { randomUUID } from 'node:crypto';
 import http from 'node:http';
 import { WebSocket, WebSocketServer } from 'ws';
 import { PeerRegistry } from './PeerRegistry.js';
-import { RateLimiter, isOriginAllowed, normalizeDisplayName, normalizeRoomCode } from './validation.js';
+import {
+  RateLimiter,
+  isOriginAllowed,
+  normalizeDisplayName,
+  normalizePeerId,
+  normalizeRoomCode,
+} from './validation.js';
 import type { ClientMessage, ServerErrorCode, ServerMessage } from './types.js';
 
 interface PeerSocket extends WebSocket {
   peerId?: string;
   isAlive?: boolean;
   rateLimiter?: RateLimiter;
+  /** True while the current rate-limit window is already over budget. */
+  rateLimited?: boolean;
+  /** Consecutive windows this socket has blown through; used to cut off a persistent flooder. */
+  rateLimitStrikes?: number;
 }
 
 export interface SignalingServerOptions {
@@ -31,6 +41,9 @@ export interface SignalingServer {
   stats(): { peers: number; rooms: number };
 }
 
+/** Consecutive over-budget windows tolerated before the connection is dropped. */
+const RATE_LIMIT_STRIKE_LIMIT = 3;
+
 const DEFAULTS = {
   maxPeersPerRoom: 8,
   maxPayloadBytes: 256 * 1024,
@@ -52,7 +65,13 @@ export function createSignalingServer(options: SignalingServerOptions = {}): Sig
 
   const httpServer = http.createServer((req, res) => {
     if (req.url === '/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        // A browser fetch of /health from the app's own origin is a cross-origin request, and
+        // unlike the WebSocket handshake it *is* subject to CORS. The body is only counters.
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-store',
+      });
       res.end(
         JSON.stringify({
           status: 'ok',
@@ -114,7 +133,11 @@ export function createSignalingServer(options: SignalingServerOptions = {}): Sig
     registry.unregister(peerId);
 
     if (room) {
+      // Strictly room-scoped: roomless peers must not learn the ids of members of a room they were
+      // never part of, and backward compatibility only requires them to hear about roomless
+      // departures.
       broadcastToRoom(room, { type: 'peer-left', id: peerId });
+      return;
     }
 
     const disconnected: ServerMessage = { type: 'peer-disconnected', id: peerId };
@@ -127,12 +150,13 @@ export function createSignalingServer(options: SignalingServerOptions = {}): Sig
    * Assigns the socket a peer id, releasing any id it already held. A requested id is honoured
    * only when free, preserving the documented "generated UUID if taken" behaviour.
    */
-  function assignPeerId(socket: PeerSocket, requestedId: string | undefined): string {
+  function assignPeerId(socket: PeerSocket, requestedId: unknown): string {
     if (socket.peerId) {
       releasePeerId(socket);
     }
 
-    return requestedId && !registry.has(requestedId) ? requestedId : randomUUID();
+    const requested = normalizePeerId(requestedId);
+    return requested && !registry.has(requested) ? requested : randomUUID();
   }
 
   function handleRegister(socket: PeerSocket, message: Extract<ClientMessage, { type: 'register' }>): void {
@@ -150,11 +174,26 @@ export function createSignalingServer(options: SignalingServerOptions = {}): Sig
     }
 
     const name = normalizeDisplayName(message.name);
-    // A peer re-joining the room it is already in does not change the head count, so it must not
-    // be turned away by the capacity check below.
-    const alreadyInRoom = socket.peerId ? registry.get(socket.peerId)?.room === room : false;
+    const current = socket.peerId ? registry.get(socket.peerId) : undefined;
 
-    if (!alreadyInRoom && registry.sizeOfRoom(room) >= maxPeersPerRoom) {
+    // Re-joining the room this socket already occupies is idempotent: the peer keeps its id and
+    // the other members keep their connections. Without this, a reconnect or a double-invoked
+    // effect in React's strict mode would look like a leave followed by a join, and every other
+    // peer would tear down and rebuild its connection - dropping in-flight file transfers and
+    // notepad state for no reason.
+    if (current && current.room === room && current.socket === socket) {
+      registry.joinRoom(current.id, room, name);
+      send(socket, {
+        type: 'joined',
+        id: current.id,
+        room,
+        name,
+        peers: registry.rosterOf(room, current.id),
+      });
+      return;
+    }
+
+    if (registry.sizeOfRoom(room) >= maxPeersPerRoom) {
       sendError(socket, 'room-full', `Room ${room} already has ${maxPeersPerRoom} peers`);
       return;
     }
@@ -178,6 +217,11 @@ export function createSignalingServer(options: SignalingServerOptions = {}): Sig
 
     if (typeof message.target !== 'string' || message.target.length === 0) {
       sendError(socket, 'invalid-message', 'signal requires a target peer id');
+      return;
+    }
+
+    if (message.target === socket.peerId) {
+      sendError(socket, 'invalid-message', 'Cannot signal yourself');
       return;
     }
 
@@ -208,9 +252,22 @@ export function createSignalingServer(options: SignalingServerOptions = {}): Sig
 
     socket.on('message', (raw) => {
       if (socket.rateLimiter && !socket.rateLimiter.accept(Date.now())) {
-        sendError(socket, 'rate-limited', 'Too many messages; slow down');
+        // Reply at most once per window, then drop silently. Answering every frame would give a
+        // runaway client 1:1 amplification - more traffic than not rate limiting at all - and a
+        // deliberate flooder would never be cut off.
+        if (!socket.rateLimited) {
+          socket.rateLimited = true;
+          socket.rateLimitStrikes = (socket.rateLimitStrikes ?? 0) + 1;
+          sendError(socket, 'rate-limited', 'Too many messages; slow down');
+
+          if (socket.rateLimitStrikes > RATE_LIMIT_STRIKE_LIMIT) {
+            socket.terminate();
+          }
+        }
         return;
       }
+
+      socket.rateLimited = false;
 
       let parsed: unknown;
       try {

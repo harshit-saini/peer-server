@@ -1,9 +1,14 @@
 import { createSignalingServer } from './server.js';
-import { parseAllowedOrigins } from './validation.js';
+import { normalizeRoomCapacity, parseAllowedOrigins } from './validation.js';
+
+const DEFAULT_MAX_PEERS_PER_ROOM = 8;
 
 const PORT = Number(process.env.PORT) || 8080;
 const allowedOrigins = parseAllowedOrigins(process.env.ALLOWED_ORIGINS);
-const maxPeersPerRoom = Number(process.env.MAX_PEERS_PER_ROOM) || undefined;
+const maxPeersPerRoom = normalizeRoomCapacity(
+  process.env.MAX_PEERS_PER_ROOM,
+  DEFAULT_MAX_PEERS_PER_ROOM,
+);
 
 const server = createSignalingServer({ allowedOrigins, maxPeersPerRoom });
 

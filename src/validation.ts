@@ -5,6 +5,43 @@ export const MAX_DISPLAY_NAME_LENGTH = 48;
 export const DEFAULT_DISPLAY_NAME = 'Guest';
 
 /**
+ * Peer ids are echoed to every other member of a room and used as map keys, so they are restricted
+ * to characters that survive a trip through a URL, a JSON round-trip, and a client-side Map.
+ */
+const PEER_ID_PATTERN = /^[A-Za-z0-9._:-]{8,64}$/;
+
+/**
+ * Returns a usable peer id, or null meaning "assign a fresh UUID instead".
+ *
+ * Without this a client can register under a number or an object: the value lands in the registry
+ * key and in every peer's roster, but those peers stringify ids (URL params, React keys, Map
+ * lookups) and can then never signal it - a participant visible to everyone and reachable by
+ * no one. Treating a malformed id as absent keeps the documented "generated UUID if
+ * omitted/taken" behaviour.
+ */
+export function normalizePeerId(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return PEER_ID_PATTERN.test(trimmed) ? trimmed : null;
+}
+
+/**
+ * Room capacity, clamped into a range that makes sense for a full mesh. Without clamping, a typo
+ * in the env var silently means either the default or (for a negative value) a server that
+ * rejects every join.
+ */
+export function normalizeRoomCapacity(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return fallback;
+  }
+  return Math.max(2, Math.min(32, Math.floor(parsed)));
+}
+
+/**
  * Returns the canonical form of a room code, or null if it is not a usable code. Rejecting
  * anything outside `[a-z0-9-]{3,64}` keeps codes safe to use as map keys, log values, and URL
  * query parameters.
