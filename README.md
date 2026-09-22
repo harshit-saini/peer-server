@@ -28,7 +28,13 @@ npm run typecheck
 `GET /health` returns `{ status, peers, rooms, uptimeSeconds }`.
 
 The server also enforces a 256 KB maximum WebSocket payload and a per-connection
-limit of 240 messages per 10 seconds.
+limit of 240 messages per 10 seconds. A client over that limit is told once per
+window and then ignored, and is disconnected after three consecutive windows -
+answering every frame would amplify a runaway client rather than slow it down.
+
+Re-sending `join` for the room a connection is already in is idempotent: the
+peer keeps its id and the other members are not notified, so a reconnect does
+not make every peer tear down and rebuild its connection.
 
 ## Protocol
 
@@ -47,8 +53,10 @@ ways to find a peer:
   hyphens) under the optional display `name`. Replaces any room the connection
   had previously joined.
 - `{ "type": "register", "id"?: string }`
-  Registers the connection under `id`, or a generated UUID if omitted/taken,
-  without joining a room.
+  Registers the connection under `id`, or a generated UUID if omitted, taken, or
+  not of the form `[A-Za-z0-9._:-]{8,64}`. A peer id is echoed to every other
+  member of a room and used as a map key, so anything outside that shape is
+  treated as absent rather than stored.
 - `{ "type": "signal", "target": string, "data": unknown }`
   Relays `data` (an SDP offer/answer or ICE candidate) to the peer with id
   `target`. The target must be in the same room as the sender.
@@ -69,7 +77,9 @@ ways to find a peer:
 - `{ "type": "signal", "from": string, "data": unknown }`
   Delivers signaling data forwarded from another peer.
 - `{ "type": "peer-disconnected", "id": string }`
-  Broadcast to peers that registered without a room when any peer disconnects.
+  Sent to peers that registered without a room when another *roomless* peer
+  disconnects. Departures from a room are reported only to that room, as
+  `peer-left`, so room membership never leaks to clients outside it.
 - `{ "type": "error", "code": string, "message": string }`
   Sent when a request is invalid. `code` is one of `invalid-json`,
   `invalid-message`, `invalid-room`, `not-registered`, `room-full`,
