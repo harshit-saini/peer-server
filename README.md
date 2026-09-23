@@ -65,6 +65,33 @@ A page served over HTTPS cannot open a `ws://` socket - browsers block it as mix
 override - so `wss://` is required, not a preference. Setting `ALLOWED_ORIGINS` to that frontend's
 origin is what stops any other site from using your server as a free relay.
 
+### Getting ALLOWED_ORIGINS right
+
+An origin is scheme + host + optional port, with no trailing slash and no path:
+
+```bash
+ALLOWED_ORIGINS=https://tools.example.com
+```
+
+A trailing slash or surrounding whitespace is stripped for you, but a path is not - a value of
+`https://tools.example.com/meet` matches nothing. The comparison is otherwise exact, which catches
+people out in three ways:
+
+- `http://` does not match `https://`, and `www.tools.example.com` does not match
+  `tools.example.com`. Whatever the browser shows in the address bar is what must be listed.
+- Preview deployments each have their own origin, so none of them match a production entry.
+- Once this is set, local development is blocked too, because `http://localhost:3000` is a
+  different origin.
+
+List everything that legitimately needs in, comma separated:
+
+```bash
+ALLOWED_ORIGINS=https://tools.example.com,http://localhost:3000
+```
+
+Leaving it unset accepts any origin. That is right for local development and wrong for anything
+reachable from the internet.
+
 ### Two things that will bite you
 
 **Run exactly one instance.** The peer registry is in memory, so two peers that land on different
