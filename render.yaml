@@ -1,0 +1,36 @@
+# Render blueprint: https://render.com/docs/blueprint-spec
+#
+# Deploy by pointing Render at this repository (New > Blueprint), or create a Web Service by hand
+# with the build and start commands below.
+#
+# IMPORTANT: this service must run as a SINGLE instance. The peer registry is in memory, so two
+# peers that land on different instances cannot see each other and will never connect. Do not
+# enable autoscaling, and keep the instance count at 1. Scaling out needs a shared backplane
+# (Redis pub/sub or similar) to relay between instances, which this server does not have.
+services:
+  - type: web
+    name: peer-server
+    runtime: node
+    plan: free
+    # --include=dev because the build needs TypeScript, which is a devDependency; some platforms
+    # set NODE_ENV=production, which would otherwise skip it and fail the build.
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    # Render restarts the instance if this stops responding. It is a plain counter endpoint and
+    # deliberately exposes no room codes.
+    healthCheckPath: /health
+    envVars:
+      # The server needs Node 20.6+ for the --import flag used by the test script; engines in
+      # package.json says the same thing.
+      - key: NODE_VERSION
+        value: "22"
+      # Comma-separated browser origins allowed to open a WebSocket, e.g.
+      # https://your-devtools-app.vercel.app. Left unset it accepts any origin, which is fine
+      # locally and wrong for anything reachable from the internet. `sync: false` makes Render
+      # prompt for it at deploy time rather than committing it here.
+      - key: ALLOWED_ORIGINS
+        sync: false
+      # A full mesh needs O(n^2) connections per room, so keep this small.
+      - key: MAX_PEERS_PER_ROOM
+        value: "8"
+    # PORT is injected by Render and read by src/index.ts; do not set it here.

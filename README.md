@@ -36,6 +36,50 @@ Re-sending `join` for the room a connection is already in is idempotent: the
 peer keeps its id and the other members are not notified, so a reconnect does
 not make every peer tear down and rebuild its connection.
 
+## Deploying to Render
+
+`render.yaml` is a blueprint: point Render at this repository (**New > Blueprint**) and it picks
+the whole configuration up. To create the service by hand instead, use:
+
+| Setting | Value |
+| --- | --- |
+| Runtime | Node |
+| Build command | `npm ci --include=dev && npm run build` |
+| Start command | `npm start` |
+| Health check path | `/health` |
+| `NODE_VERSION` | `22` |
+| `ALLOWED_ORIGINS` | the origin your frontend is served from |
+
+`--include=dev` matters: the build needs TypeScript, which is a devDependency, and a platform that
+sets `NODE_ENV=production` would otherwise skip it and fail. `PORT` is injected by Render and read
+by `src/index.ts`; don't set it yourself.
+
+Render terminates TLS for you, so the service answers on `https://<name>.onrender.com` and clients
+connect to `wss://<name>.onrender.com`. Point the frontend at it with:
+
+```bash
+NEXT_PUBLIC_PEER_SERVER_URL=wss://<name>.onrender.com
+```
+
+A page served over HTTPS cannot open a `ws://` socket - browsers block it as mixed content with no
+override - so `wss://` is required, not a preference. Setting `ALLOWED_ORIGINS` to that frontend's
+origin is what stops any other site from using your server as a free relay.
+
+### Two things that will bite you
+
+**Run exactly one instance.** The peer registry is in memory, so two peers that land on different
+instances cannot see each other and never connect. Leave autoscaling off and the instance count at
+1. Scaling out needs a shared backplane (Redis pub/sub or similar) to relay between instances,
+which this server does not have.
+
+**The free plan sleeps.** Render spins a free instance down after 15 minutes without traffic, and
+the next request pays a cold start of roughly a minute. For a signaling server that means the
+first person to open a room waits, decides it is broken, and reloads. A paid instance type avoids
+it; keeping a free one awake with an external pinger works but burns the monthly free hours.
+
+Nothing is persisted, so a redeploy or restart drops every room. Anyone connected at that moment
+reconnects automatically and re-joins, but a room is only ever as durable as the processes in it.
+
 ## Protocol
 
 Clients connect over `ws://host:port` and exchange JSON messages. There are two
